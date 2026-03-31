@@ -47,6 +47,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command,
         } => resume_session(&session_path, command),
         CliAction::ResumeNamed { target, command } => resume_named_session(&target, command),
+        CliAction::InspectSession { target } => inspect_session(&target),
         CliAction::ListSessions { query, limit } => list_sessions(query.as_deref(), limit),
         CliAction::Prompt { prompt, model } => LiveCli::new(model, false)?.run_turn(&prompt)?,
         CliAction::Repl { model } => run_repl(model)?,
@@ -70,6 +71,9 @@ enum CliAction {
     ResumeNamed {
         target: String,
         command: Option<String>,
+    },
+    InspectSession {
+        target: String,
     },
     ListSessions {
         query: Option<String>,
@@ -124,6 +128,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "resume" => parse_named_resume_args(&rest[1..]),
+        "session" => parse_session_inspect_args(&rest[1..]),
         "sessions" => parse_sessions_args(&rest[1..]),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "prompt" => {
@@ -175,6 +180,17 @@ fn parse_named_resume_args(args: &[String]) -> Result<CliAction, String> {
         return Err("resume accepts at most one trailing slash command".to_string());
     }
     Ok(CliAction::ResumeNamed { target, command })
+}
+
+fn parse_session_inspect_args(args: &[String]) -> Result<CliAction, String> {
+    let target = args
+        .first()
+        .ok_or_else(|| "missing session id, path, or 'latest' for session".to_string())?
+        .clone();
+    if args.len() > 1 {
+        return Err("session accepts exactly one target argument".to_string());
+    }
+    Ok(CliAction::InspectSession { target })
 }
 
 fn parse_sessions_args(args: &[String]) -> Result<CliAction, String> {
@@ -330,6 +346,53 @@ fn list_sessions(query: Option<&str>, limit: usize) {
             eprintln!("failed to list sessions: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+fn inspect_session(target: &str) {
+    let path = match resolve_session_target(target) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+
+    let session = match Session::load_from_path(&path) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("failed to load session: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let metadata = fs::metadata(&path).ok();
+    let updated_unix = metadata
+        .as_ref()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_secs());
+    let bytes = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+    let usage = runtime::UsageTracker::from_session(&session).cumulative_usage();
+
+    println!("Session details:");
+    println!(
+        "- id: {}",
+        path.file_stem()
+            .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned())
+    );
+    println!("- path: {}", path.display());
+    println!("- updated: {updated_unix}");
+    println!("- size_bytes: {bytes}");
+    println!("- messages: {}", session.messages.len());
+    println!("- total_tokens: {}", usage.total_tokens());
+    println!("- preview: {}", session_preview(&session));
+
+    if let Some(user_text) = latest_text_for_role(&session, MessageRole::User) {
+        println!("- latest_user: {user_text}");
+    }
+    if let Some(assistant_text) = latest_text_for_role(&session, MessageRole::Assistant) {
+        println!("- latest_assistant: {assistant_text}");
     }
 }
 
@@ -645,6 +708,21 @@ fn session_preview(session: &Session) -> String {
         }
     }
     "No text preview available".to_string()
+}
+
+fn latest_text_for_role(session: &Session, role: MessageRole) -> Option<String> {
+    session.messages.iter().rev().find_map(|message| {
+        if message.role != role {
+            return None;
+        }
+        message.blocks.iter().find_map(|block| match block {
+            ContentBlock::Text { text } => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| truncate_preview(trimmed, 120))
+            }
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+    })
 }
 
 fn truncate_preview(text: &str, max_chars: usize) -> String {
@@ -1033,6 +1111,7 @@ fn print_help() {
     println!("  rusty-claude-cli dump-manifests");
     println!("  rusty-claude-cli bootstrap-plan");
     println!("  rusty-claude-cli sessions [--query TEXT] [--limit N]");
+    println!("  rusty-claude-cli session <latest|SESSION|PATH>");
     println!("  rusty-claude-cli resume <latest|SESSION|PATH> [/compact]");
     println!("  env RUSTY_CLAUDE_PERMISSION_MODE=prompt enables interactive tool approval");
     println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
@@ -1103,6 +1182,17 @@ mod tests {
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.json"),
                 command: Some("/compact".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_session_inspect_subcommand() {
+        let args = vec!["session".to_string(), "latest".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::InspectSession {
+                target: "latest".to_string(),
             }
         );
     }
